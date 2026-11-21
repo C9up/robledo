@@ -1,0 +1,104 @@
+{
+  "name": "@c9up/robledo",
+  "version": "0.1.0",
+  "description": "Robledo — over-the-air updates for a ream app's mobile build: signed by ream, served by the app, verified on the phone, rolled back when they crash",
+  "license": "MIT",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    },
+    "./provider": {
+      "types": "./src/RobledoProvider.ts",
+      "import": "./src/RobledoProvider.ts"
+    },
+    "./services/main": {
+      "types": "./src/services/main.ts",
+      "import": "./src/services/main.ts"
+    },
+    "./mobile": {
+      "types": "./src/mobile/index.ts",
+      "import": "./src/mobile/index.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "test:rust": "cargo test --workspace",
+    "lint": "biome check src/ tests/",
+    "test:coverage": "vitest run --coverage",
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.12",
+    "@types/node": "^22.20.1",
+    "@vitest/coverage-v8": "4.1.11",
+    "typescript": "^6.0.3",
+    "vitest": "4.1.11"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "files": [
+    "src",
+    "dist",
+    "specs",
+    "Cargo.toml",
+    "Cargo.lock",
+    "crates/robledo-client/src",
+    "crates/robledo-client/Cargo.toml",
+    "android/robledo.cmake",
+    "android/src",
+    "README.md",
+    "LICENSE"
+  ],
+  "reamNative": {
+    "specs": "specs",
+    "rust": [
+      {
+        "manifest": "crates/robledo-client/Cargo.toml",
+        "lib": "robledo_client"
+      }
+    ],
+    "android": {
+      "java": "android/src/main/java",
+      "cmake": {
+        "file": "android/robledo.cmake",
+        "link": "robledo_link"
+      },
+      "cxxModules": [
+        {
+          "name": "NativeRobledo",
+          "header": "NativeRobledo.h"
+        }
+      ],
+      "bundleProvider": "com.c9up.robledo.Robledo.bundleFile"
+    }
+  },
+  "publishConfig": {
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "import": "./dist/index.js"
+      },
+      "./provider": {
+        "types": "./dist/RobledoProvider.d.ts",
+        "import": "./dist/RobledoProvider.js"
+      },
+      "./services/main": {
+        "types": "./dist/services/main.d.ts",
+        "import": "./dist/services/main.js"
+      },
+      "./mobile": {
+        "types": "./dist/mobile/index.d.ts",
+        "import": "./dist/mobile/index.js"
+      }
+    },
+    "access": "public"
+  }
+}

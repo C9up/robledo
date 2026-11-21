@@ -1,0 +1,13 @@
+node_modules/
+# A directory, or a link to a build directory outside the repository
+target
+dist/
+coverage/
+*.node
+.env
+.env.local
+.DS_Store
+*.log
+.turbo/
+# Workstream: the maintainer's local tracking, never published
+.workstream/
