@@ -472,6 +472,50 @@ mod tests {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
+    // Fixed vectors: a signature or digest that changes across a crypto crate
+    // upgrade would make every installed app refuse the next update.
+    const RFC8032_PUBLIC: &str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+    const RFC8032_SIGNATURE: &str = "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b";
+    const VECTOR_MESSAGE: &[u8] = b"robledo update manifest vector";
+    /// The public key, signature and digest of VECTOR_MESSAGE under the `[7; 32]`
+    /// seed, as ed25519-dalek 2 / sha2 0.10 / base64 0.22 produced them.
+    const VECTOR_PUBLIC: &str = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=";
+    const VECTOR_SIGNATURE: &str =
+        "bkEEfchf5aF/atZ+tO0U5Tb254nZNLunaeSIx5YjjzJ3iLVS7RNsDPHUsBb9acM/nIFn3H81Uc12xZl2V3MzDg==";
+    const VECTOR_SHA256: &str = "bb558155f17e9a932b286dd54c5d5e143ff8ab009824b1a2dfdb019895e4c961";
+
+    #[test]
+    fn verifies_rfc8032_test_1() {
+        let public = hex32(RFC8032_PUBLIC).expect("hex");
+        let signature = (0..64)
+            .map(|i| u8::from_str_radix(&RFC8032_SIGNATURE[2 * i..2 * i + 2], 16).expect("hex"))
+            .collect::<Vec<u8>>();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&signature);
+        assert_eq!(verify(&public, b"", &encoded), Ok(()));
+        assert!(verify(&public, b"x", &encoded).is_err());
+    }
+
+    #[test]
+    fn keeps_the_signatures_and_digests_of_earlier_releases() {
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD.encode(key().verifying_key().to_bytes()),
+            VECTOR_PUBLIC
+        );
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD.encode(key().sign(VECTOR_MESSAGE).to_bytes()),
+            VECTOR_SIGNATURE
+        );
+        assert_eq!(
+            verify(
+                &key().verifying_key().to_bytes(),
+                VECTOR_MESSAGE,
+                VECTOR_SIGNATURE
+            ),
+            Ok(())
+        );
+        assert_eq!(hex(&Sha256::digest(VECTOR_MESSAGE)), VECTOR_SHA256);
+    }
+
     /// A signed update `id` whose bundle prints `body`.
     type Files = Vec<(String, Vec<u8>)>;
 

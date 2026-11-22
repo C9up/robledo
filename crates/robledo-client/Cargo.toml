@@ -10,7 +10,8 @@ description = "robledo's client on the phone: verifies a signed update, stages i
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
-base64 = "0.22"
-ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+base64 = "0.23"
+# Verifies only: no secret key on the phone, so nothing to zeroize.
+ed25519-dalek = { version = "3", default-features = false }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
