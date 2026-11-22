@@ -1,6 +1,6 @@
 {
   "name": "@c9up/robledo",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Robledo — over-the-air updates for a ream app's mobile build: signed by ream, served by the app, verified on the phone, rolled back when they crash",
   "license": "MIT",
   "repository": {
