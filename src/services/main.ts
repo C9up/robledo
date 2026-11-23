@@ -4,7 +4,7 @@
  *     import robledo from "@c9up/robledo/services/main"
  *     robledo.registerRoutes()
  */
-import { RobledoError } from "../errors.js";
+import { E_ROBLEDO_NOT_BOOTED } from "../errors.js";
 import { Robledo } from "../server/Robledo.js";
 
 let instance: Robledo | undefined;
@@ -26,10 +26,7 @@ export function clearRobledo(): void {
 
 function current(): Robledo {
 	if (instance === undefined) {
-		throw new RobledoError(
-			"E_ROBLEDO_NOT_BOOTED",
-			"[robledo] not booted: add @c9up/robledo/provider to reamrc.ts's providers",
-		);
+		throw new E_ROBLEDO_NOT_BOOTED();
 	}
 	return instance;
 }

@@ -3,8 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+	errors,
 	Robledo,
-	RobledoError,
 	type RobledoHttpContext,
 	registerRobledoRoutes,
 } from "../../src/index.js";
@@ -70,8 +70,12 @@ describe("Robledo on the server", () => {
 	});
 
 	it("refuses a prefix that is not a path", () => {
-		expect(() => new Robledo({ prefix: "robledo" })).toThrow(RobledoError);
-		expect(() => new Robledo({ prefix: "/robledo/" })).toThrow(RobledoError);
+		expect(() => new Robledo({ prefix: "robledo" })).toThrow(
+			errors.E_ROBLEDO_INVALID_PREFIX,
+		);
+		expect(() => new Robledo({ prefix: "/robledo/" })).toThrow(
+			errors.E_ROBLEDO_INVALID_PREFIX,
+		);
 	});
 
 	it("mounts its routes when the application asks, before or after the router came", async () => {

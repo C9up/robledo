@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { resolve, sep } from "node:path";
-import { RobledoError } from "../errors.js";
+import { E_ROBLEDO_INVALID_PREFIX } from "../errors.js";
 
 /**
  * robledo on the server: it serves the updates `ream android:publish` signed
@@ -58,10 +58,7 @@ export class Robledo {
 		this.directory = resolvePath(config.directory ?? "robledo");
 		const prefix = config.prefix ?? "/__robledo";
 		if (!prefix.startsWith("/") || prefix.endsWith("/")) {
-			throw new RobledoError(
-				"E_ROBLEDO_INVALID_PREFIX",
-				`[robledo] prefix ${JSON.stringify(prefix)} must start with / and not end with one`,
-			);
+			throw new E_ROBLEDO_INVALID_PREFIX([prefix]);
 		}
 		this.prefix = prefix;
 	}

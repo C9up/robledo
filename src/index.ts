@@ -7,7 +7,7 @@
  *   part verifies each against the key built into the app, switches at the
  *   next start, and rolls back one that never reported ready.
  */
-export { RobledoError, type RobledoErrorCode } from "./errors.js";
+export * as errors from "./errors.js";
 export {
 	type LatestUpdate,
 	Robledo,

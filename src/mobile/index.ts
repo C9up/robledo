@@ -15,7 +15,13 @@
  * abandoned at the start after, and the previous one runs again.
  */
 import { TurboModuleRegistry } from "react-native";
-import { RobledoError } from "../errors.js";
+import {
+	E_ROBLEDO_BAD_RESPONSE,
+	E_ROBLEDO_NO_NATIVE_MODULE,
+	E_ROBLEDO_REFUSED,
+} from "../errors.js";
+
+export * as errors from "../errors.js";
 
 export const NATIVE_MODULE_NAME = "NativeRobledo";
 
@@ -74,10 +80,7 @@ function native(): NativeRobledo {
 	if (override) return override;
 	const module = TurboModuleRegistry.getEnforcing(NATIVE_MODULE_NAME);
 	if (!isNative(module)) {
-		throw new RobledoError(
-			"E_ROBLEDO_NO_NATIVE_MODULE",
-			"[robledo] the NativeRobledo module is missing: build the app with @c9up/robledo installed (ream android:build)",
-		);
+		throw new E_ROBLEDO_NO_NATIVE_MODULE();
 	}
 	return module;
 }
@@ -125,19 +128,17 @@ export async function checkForUpdate(
 	const response = await get(`${base}/latest`);
 	if (response.status === 204) return { kind: "none" };
 	if (!response.ok) {
-		throw new RobledoError(
-			"E_ROBLEDO_BAD_RESPONSE",
-			`[robledo] ${base}/latest answered ${response.status}`,
-		);
+		throw new E_ROBLEDO_BAD_RESPONSE([
+			`${base}/latest answered ${response.status}`,
+		]);
 	}
 	const body: unknown = await response.json();
 	const manifest = text(body, "manifest");
 	const signature = text(body, "signature");
 	if (manifest === "" || signature === "") {
-		throw new RobledoError(
-			"E_ROBLEDO_BAD_RESPONSE",
-			`[robledo] ${base}/latest did not answer a manifest and a signature`,
-		);
+		throw new E_ROBLEDO_BAD_RESPONSE([
+			`${base}/latest did not answer a manifest and a signature`,
+		]);
 	}
 	const { id, paths } = listedFiles(manifest);
 	if (id === status.current) return { kind: "current", id };
@@ -147,10 +148,7 @@ export async function checkForUpdate(
 			const url = `${base}/${encodeURIComponent(id)}/files/${path.split("/").map(encodeURIComponent).join("/")}`;
 			const file = await get(url);
 			if (!file.ok) {
-				throw new RobledoError(
-					"E_ROBLEDO_BAD_RESPONSE",
-					`[robledo] ${url} answered ${file.status}`,
-				);
+				throw new E_ROBLEDO_BAD_RESPONSE([`${url} answered ${file.status}`]);
 			}
 			return file.arrayBuffer();
 		}),
@@ -161,9 +159,8 @@ export async function checkForUpdate(
 			id: native().stage(manifest, signature, paths, files),
 		};
 	} catch (error) {
-		throw new RobledoError(
-			"E_ROBLEDO_REFUSED",
-			`[robledo] update ${id} refused: ${error instanceof Error ? error.message : String(error)}`,
+		throw new E_ROBLEDO_REFUSED(
+			[id, error instanceof Error ? error.message : String(error)],
 			{ cause: error },
 		);
 	}

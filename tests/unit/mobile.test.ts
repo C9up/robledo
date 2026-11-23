@@ -1,7 +1,8 @@
+import { Exception } from "@c9up/flare";
 import { afterEach, describe, expect, it } from "vitest";
-import { RobledoError } from "../../src/index.js";
 import {
 	checkForUpdate,
+	errors,
 	markReady,
 	NATIVE_MODULE_NAME,
 	type NativeRobledo,
@@ -137,7 +138,7 @@ describe("checkForUpdate", () => {
 			try {
 				await run();
 			} catch (error) {
-				return error instanceof RobledoError ? error.code : String(error);
+				return error instanceof Exception ? error.code : String(error);
 			}
 			return undefined;
 		};
@@ -186,7 +187,7 @@ describe("the native module", () => {
 		modules.delete(NATIVE_MODULE_NAME);
 		expect(() => updateStatus()).toThrow(/TurboModuleRegistry/);
 		modules.set(NATIVE_MODULE_NAME, { status: "not a function" });
-		expect(() => updateStatus()).toThrow(RobledoError);
+		expect(() => updateStatus()).toThrow(errors.E_ROBLEDO_NO_NATIVE_MODULE);
 		const native = new FakeNative();
 		modules.set(NATIVE_MODULE_NAME, native);
 		expect(updateStatus().runtimeVersion).toBe("rt1");

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { Robledo, RobledoError } from "../../src/index.js";
+import { errors, Robledo } from "../../src/index.js";
 import RobledoProvider from "../../src/RobledoProvider.js";
 import robledo from "../../src/services/main.js";
 
@@ -48,7 +48,7 @@ describe("RobledoProvider", () => {
 		expect(await host.container.resolve("robledo")).toBe(instance);
 		expect(robledo.prefix).toBe("/updates");
 		await provider.shutdown();
-		expect(() => robledo.prefix).toThrow(RobledoError);
+		expect(() => robledo.prefix).toThrow(errors.E_ROBLEDO_NOT_BOOTED);
 	});
 
 	it("mounts the routes on the host router once the application asks", async () => {
