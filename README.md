@@ -76,9 +76,18 @@ What a phone checks before it keeps an update:
   app — the server holds no key, so a compromised server can withhold an
   update but not forge one;
 - its runtime and platform;
+- that it is newer than every update this phone accepted, and than the
+  bundle inside the app when the build records its date: the manifest's
+  signed `createdAt` orders updates, so a server or a CDN serving an old,
+  validly signed update again cannot roll a phone back to it;
+- when the build records the app's id, that the update names the same app;
 - every file's SHA-256 and size, and that no path leaves the update's
   directory;
 - that the update did not crash on this phone before.
+
+The signature is checked before any file is fetched. Files then come four at a
+time, each refused as soon as it runs past the size the signed manifest gives,
+and go to the native side as they arrive.
 
 Updates are fetched over https; plain http is accepted only to this computer
 (`localhost`, `127.0.0.1`, or the emulator's `10.0.2.2`), for development.
@@ -89,6 +98,14 @@ At each start, an update launched for the first time is on trial until the
 app calls `markReady()`. One that never does — it crashed, or was killed
 before its first screen — is dropped at the next start: the previous update
 (or the app's own bundle) runs, and the failed one is not staged again.
+
+To roll back on purpose, publish the old code again with `ream android:publish`:
+it is signed as a new update, newer than the one to replace. Pointing `latest`
+back at an old update does not work: a phone refuses an update that is not
+newer than the newest it accepted (`E_ROBLEDO_NOT_NEWER`), and that bar does
+not come down when a crashed update is rolled back. Two updates published in
+the same second are not ordered: the second is refused by phones that took
+the first.
 
 ## Configuration
 

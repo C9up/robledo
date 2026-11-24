@@ -34,3 +34,14 @@ export const E_ROBLEDO_REFUSED = createError<[string, string]>(
 	"[robledo] update %s refused: %s",
 	"E_ROBLEDO_REFUSED",
 );
+
+/**
+ * The phone refused an update that is not newer than the newest it accepted
+ * (or than the bundle inside the app): an old, validly signed update replayed
+ * by the server or something in front of it. A deliberate rollback is
+ * published as a new update.
+ */
+export const E_ROBLEDO_NOT_NEWER = createError<[string]>(
+	"[robledo] %s",
+	"E_ROBLEDO_NOT_NEWER",
+);

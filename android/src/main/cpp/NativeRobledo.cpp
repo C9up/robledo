@@ -37,7 +37,7 @@ Bytes bytesOf(jsi::Runtime& rt, jsi::Object object) {
   jsi::Value byteLength = object.getProperty(rt, "byteLength");
   if (!inner.isObject() || !byteOffset.isNumber() || !byteLength.isNumber() ||
       !inner.getObject(rt).isArrayBuffer(rt)) {
-    throw jsi::JSError(rt, "[robledo] stage expects ArrayBuffers or Uint8Arrays");
+    throw jsi::JSError(rt, "[robledo] receive expects an ArrayBuffer or a Uint8Array");
   }
   out.buffer.emplace(inner.getObject(rt).getArrayBuffer(rt));
   out.offset = static_cast<size_t>(byteOffset.getNumber());
@@ -62,42 +62,40 @@ std::string NativeRobledo::status(jsi::Runtime& rt) {
   return text;
 }
 
-std::string NativeRobledo::stage(
-    jsi::Runtime& rt, std::string manifest, std::string signature, jsi::Array paths, jsi::Array files) {
-  size_t count = paths.size(rt);
-  if (files.size(rt) != count) {
-    throw jsi::JSError(rt, "[robledo] stage needs as many files as paths");
-  }
-  std::vector<std::string> pathStrings;
-  std::vector<Bytes> buffers;
-  pathStrings.reserve(count);
-  buffers.reserve(count);
-  for (size_t i = 0; i < count; i++) {
-    pathStrings.push_back(paths.getValueAtIndex(rt, i).asString(rt).utf8(rt));
-    buffers.push_back(bytesOf(rt, files.getValueAtIndex(rt, i).asObject(rt)));
-  }
-  std::vector<const uint8_t*> pathPtrs;
-  std::vector<size_t> pathLens;
-  std::vector<const uint8_t*> dataPtrs;
-  std::vector<size_t> dataLens;
-  for (size_t i = 0; i < count; i++) {
-    pathPtrs.push_back(reinterpret_cast<const uint8_t*>(pathStrings[i].data()));
-    pathLens.push_back(pathStrings[i].size());
-    dataPtrs.push_back(buffers[i].buffer->data(rt) + buffers[i].offset);
-    dataLens.push_back(buffers[i].length);
-  }
+std::string NativeRobledo::verify(jsi::Runtime& rt, std::string manifest, std::string signature) {
   RobledoBuf out{};
-  int32_t code = robledo_stage(
+  int32_t code = robledo_verify(
       reinterpret_cast<const uint8_t*>(manifest.data()),
       manifest.size(),
       reinterpret_cast<const uint8_t*>(signature.data()),
       signature.size(),
-      count,
-      pathPtrs.data(),
-      pathLens.data(),
-      dataPtrs.data(),
-      dataLens.data(),
       &out);
+  std::string text = take(out);
+  if (code != 0) {
+    throw jsi::JSError(rt, text);
+  }
+  return text;
+}
+
+// The bytes are read in place, straight from the JS buffer: no copy is kept.
+void NativeRobledo::receive(jsi::Runtime& rt, std::string path, jsi::Object file) {
+  Bytes bytes = bytesOf(rt, std::move(file));
+  RobledoBuf out{};
+  int32_t code = robledo_receive(
+      reinterpret_cast<const uint8_t*>(path.data()),
+      path.size(),
+      bytes.buffer->data(rt) + bytes.offset,
+      bytes.length,
+      &out);
+  std::string text = take(out);
+  if (code != 0) {
+    throw jsi::JSError(rt, text);
+  }
+}
+
+std::string NativeRobledo::finish(jsi::Runtime& rt) {
+  RobledoBuf out{};
+  int32_t code = robledo_finish(&out);
   std::string text = take(out);
   if (code != 0) {
     throw jsi::JSError(rt, text);

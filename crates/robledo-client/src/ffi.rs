@@ -35,7 +35,7 @@ impl RobledoBuf {
 #[no_mangle]
 pub unsafe extern "C" fn robledo_buf_free(buf: RobledoBuf) {
     if !buf.ptr.is_null() {
-        drop(Vec::from_raw_parts(buf.ptr, buf.len, buf.cap));
+        let _ = std::panic::catch_unwind(|| drop(Vec::from_raw_parts(buf.ptr, buf.len, buf.cap)));
     }
 }
 
@@ -107,33 +107,57 @@ pub unsafe extern "C" fn robledo_open(
     }
 }
 
-/// Verify and stage an update: the manifest, its base64 signature, and
-/// `count` files (path, bytes). Returns 0 with its id in `out`, or 1 with why
-/// it was refused.
+/// Check an update's manifest and signature before anything it names is
+/// fetched (signature, runtime, platform, app, crash record, order). Returns 0
+/// with `{"id": …, "staging": bool}` in `out` — `staging` false when the update
+/// is already current or pending — or 1 with why it was refused.
 ///
 /// # Safety
-/// Each pointer must hold its length; the arrays must hold `count` items.
+/// Each pointer must hold its length; `out` must be valid.
 #[no_mangle]
-pub unsafe extern "C" fn robledo_stage(
+pub unsafe extern "C" fn robledo_verify(
     manifest: *const u8,
     manifest_len: usize,
     signature: *const u8,
     signature_len: usize,
-    count: usize,
-    paths: *const *const u8,
-    path_lens: *const usize,
-    data: *const *const u8,
-    data_lens: *const usize,
     out: *mut RobledoBuf,
 ) -> i32 {
-    let manifest = bytes(manifest, manifest_len).to_vec();
+    let manifest = bytes(manifest, manifest_len);
     let signature = String::from_utf8_lossy(bytes(signature, signature_len)).to_string();
-    let mut files = Vec::with_capacity(count);
-    for i in 0..count {
-        let path = String::from_utf8_lossy(bytes(*paths.add(i), *path_lens.add(i))).to_string();
-        files.push((path, bytes(*data.add(i), *data_lens.add(i)).to_vec()));
-    }
-    with_store(out, |store| store.stage(&manifest, &signature, &files))
+    with_store(out, |store| {
+        let begun = store.begin(manifest, &signature)?;
+        Ok(serde_json::json!({ "id": begun.id, "staging": begun.staging }).to_string())
+    })
+}
+
+/// One file of the update `robledo_verify` accepted, checked against its
+/// signed size and digest and written at once. Returns 0, or 1 with why.
+///
+/// # Safety
+/// Each pointer must hold its length; `out` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn robledo_receive(
+    path: *const u8,
+    path_len: usize,
+    data: *const u8,
+    data_len: usize,
+    out: *mut RobledoBuf,
+) -> i32 {
+    let path = String::from_utf8_lossy(bytes(path, path_len)).to_string();
+    let data = bytes(data, data_len);
+    with_store(out, |store| {
+        store.receive(&path, data).map(|()| String::new())
+    })
+}
+
+/// Every file arrived: keep the update for the next start. Returns 0 with its
+/// id in `out`, or 1 with why it was refused.
+///
+/// # Safety
+/// `out` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn robledo_finish(out: *mut RobledoBuf) -> i32 {
+    with_store(out, |store| store.finish())
 }
 
 /// The app showed its first screen. Returns 0, or 1 with the error in `out`.

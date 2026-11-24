@@ -5,9 +5,12 @@
 //! `ream android:publish`, and the files it lists. This crate:
 //!
 //! - **stages** one: checks the signature against the public key built into
-//!   the app, the runtime against the app's own, each file against its
-//!   digest, and writes it under `bundles/<id>` beside a `pending` mark —
-//!   nothing a network or a server could alter is ever launched;
+//!   the app — before any file is fetched — the runtime against the app's
+//!   own, that it is newer than every update this phone accepted and than the
+//!   bundle inside the app (a replayed old update is refused), each file
+//!   against its digest and size as it arrives, and writes it under
+//!   `bundles/<id>` beside a `pending` mark — nothing a network or a server
+//!   could alter or replay is ever launched;
 //! - **launches** at the next start: a pending update becomes current, on
 //!   trial; the previous one is kept;
 //! - **rolls back**: an update on trial that never reported ready (it crashed
@@ -30,6 +33,12 @@ use sha2::{Digest, Sha256};
 
 pub mod ffi;
 
+/// The largest manifest a phone reads (its bytes), and the most files it may
+/// list: a manifest is checked before anything it names is fetched, and these
+/// bound what checking it costs.
+pub const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
+pub const MAX_FILES: usize = 4096;
+
 /// What the app was built with (`ream android:*` writes it into the app).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
@@ -37,6 +46,14 @@ pub struct Config {
     pub public_key: [u8; 32],
     pub runtime: String,
     pub platform: String,
+    /// When the bundle inside the app was built (`embeddedCreatedAt`, seconds):
+    /// an update not newer than it is refused, and dropped at launch once a
+    /// store release brings a newer bundle. Absent from builds that do not
+    /// write it.
+    pub embedded_created_at: Option<u64>,
+    /// The app's id (`appId`): when the build writes it, an update must name
+    /// the same app. Absent from builds that do not write it.
+    pub app_id: Option<String>,
 }
 
 pub fn parse_config(bytes: &[u8]) -> Result<Config, String> {
@@ -57,11 +74,24 @@ pub fn parse_config(bytes: &[u8]) -> Result<Config, String> {
         .map_err(|_| "config: `publicKey` is not a 32-byte Ed25519 key".to_string())?;
     VerifyingKey::from_bytes(&public_key)
         .map_err(|_| "config: `publicKey` is not a valid Ed25519 key".to_string())?;
+    let embedded_created_at = match value.get("embeddedCreatedAt") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_u64()
+                .ok_or("config: `embeddedCreatedAt` is not a number of seconds")?,
+        ),
+    };
+    let app_id = match value.get("appId") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(text("appId")?),
+    };
     Ok(Config {
         url: text("url")?,
         public_key,
         runtime: text("runtimeVersion")?,
         platform: text("platform")?,
+        embedded_created_at,
+        app_id,
     })
 }
 
@@ -75,6 +105,10 @@ pub struct FileEntry {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Manifest {
     pub id: String,
+    /// When `ream android:publish` built it (seconds): what orders updates.
+    pub created_at: u64,
+    /// The app it is for, when the publisher names one.
+    pub app_id: Option<String>,
     pub runtime: String,
     pub platform: String,
     pub launch: String,
@@ -113,6 +147,9 @@ fn hex32(text: &str) -> Option<[u8; 32]> {
 }
 
 pub fn parse_manifest(bytes: &[u8]) -> Result<Manifest, String> {
+    if bytes.len() > MAX_MANIFEST_BYTES {
+        return Err(format!("manifest: larger than {MAX_MANIFEST_BYTES} bytes"));
+    }
     let value: Value = serde_json::from_slice(bytes).map_err(|e| format!("manifest: {e}"))?;
     let text = |key: &str| {
         value
@@ -125,14 +162,26 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<Manifest, String> {
     if !valid_id(&id) {
         return Err(format!("manifest: id {id:?} is not a bundle id"));
     }
+    let created_at = value
+        .get("createdAt")
+        .and_then(Value::as_u64)
+        .filter(|&t| t > 0)
+        .ok_or("manifest: `createdAt` is missing")?;
+    let app_id = match value.get("appId") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(text("appId")?),
+    };
     let launch = text("launch")?;
     let mut seen = HashSet::new();
     let mut files = Vec::new();
-    for file in value
+    let listed = value
         .get("files")
         .and_then(Value::as_array)
-        .ok_or("manifest: `files` is missing")?
-    {
+        .ok_or("manifest: `files` is missing")?;
+    if listed.len() > MAX_FILES {
+        return Err(format!("manifest: more than {MAX_FILES} files"));
+    }
+    for file in listed {
         let path = file
             .get("path")
             .and_then(Value::as_str)
@@ -162,6 +211,8 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<Manifest, String> {
     }
     Ok(Manifest {
         id,
+        created_at,
+        app_id,
         runtime: text("runtimeVersion")?,
         platform: text("platform")?,
         launch,
@@ -191,6 +242,9 @@ struct State {
     trial: Option<String>,
     /// Updates that crashed on trial, newest last.
     failed: Vec<String>,
+    /// The highest `createdAt` this phone ever accepted: an update is staged
+    /// only when newer. A rollback after a crash does not lower it.
+    newest: u64,
 }
 
 const KEPT_FAILURES: usize = 20;
@@ -226,6 +280,7 @@ impl State {
                         .collect()
                 })
                 .unwrap_or_default(),
+            newest: value.get("newest").and_then(Value::as_u64).unwrap_or(0),
         }
     }
 
@@ -236,8 +291,24 @@ impl State {
             "pending": self.pending,
             "trial": self.trial,
             "failed": self.failed,
+            "newest": self.newest,
         })
     }
+}
+
+/// An update whose manifest was accepted, receiving its files.
+struct Staging {
+    manifest: Manifest,
+    bytes: Vec<u8>,
+    received: HashSet<String>,
+}
+
+/// What `begin` decided: the update's id, and whether its files are wanted
+/// (false when it is already current or pending).
+#[derive(Debug, PartialEq)]
+pub struct Begun {
+    pub id: String,
+    pub staging: bool,
 }
 
 /// An app's updates, in its private directory.
@@ -245,6 +316,7 @@ pub struct Store {
     dir: PathBuf,
     config: Config,
     state: State,
+    staging: Option<Staging>,
 }
 
 impl Store {
@@ -252,11 +324,36 @@ impl Store {
         std::fs::create_dir_all(dir.join("bundles"))
             .map_err(|e| format!("{}: {e}", dir.display()))?;
         let state = State::read(&dir.join("state.json"));
-        Ok(Store {
+        let mut store = Store {
             dir: dir.to_path_buf(),
             config,
             state,
-        })
+            staging: None,
+        };
+        if store.state.newest == 0 {
+            // A state written before updates were ordered: the bar is what
+            // this phone holds now.
+            store.state.newest = [&store.state.current, &store.state.pending]
+                .into_iter()
+                .flatten()
+                .filter_map(|id| store.manifest_of(id))
+                .map(|m| m.created_at)
+                .max()
+                .unwrap_or(0);
+        }
+        Ok(store)
+    }
+
+    fn manifest_of(&self, id: &str) -> Option<Manifest> {
+        parse_manifest(&std::fs::read(self.bundle(id).join("manifest.json")).ok()?).ok()
+    }
+
+    /// No update older than this is staged: the newest this phone accepted,
+    /// or the bundle inside the app when that is newer.
+    fn floor(&self) -> u64 {
+        self.state
+            .newest
+            .max(self.config.embedded_created_at.unwrap_or(0))
     }
 
     pub fn config(&self) -> &Config {
@@ -274,12 +371,15 @@ impl Store {
         self.dir.join("bundles").join(id)
     }
 
-    /// The file to launch for bundle `id`, if it is there and still a
-    /// manifest this runtime can run.
+    /// The file to launch for bundle `id`, if it is there, still a manifest
+    /// this runtime can run, and newer than the bundle inside the app.
     fn launch_path(&self, id: &str) -> Option<PathBuf> {
-        let manifest =
-            parse_manifest(&std::fs::read(self.bundle(id).join("manifest.json")).ok()?).ok()?;
+        let manifest = self.manifest_of(id)?;
         if manifest.runtime != self.config.runtime {
+            return None;
+        }
+        if manifest.created_at <= self.config.embedded_created_at.unwrap_or(0) {
+            // A store release brought a newer bundle than this update.
             return None;
         }
         let path = self.bundle(id).join("files").join(&manifest.launch);
@@ -308,8 +408,9 @@ impl Store {
         }
         let excess = s.failed.len().saturating_sub(KEPT_FAILURES);
         s.failed.drain(..excess);
-        // A bundle that vanished or no longer fits this runtime (the app was
-        // updated from its store) is dropped, and the one inside the app runs.
+        // A bundle that vanished, no longer fits this runtime or is older
+        // than the bundle inside the app (the app was updated from its store)
+        // is dropped, and the one inside the app runs.
         let mut chosen = None;
         while let Some(id) = self.state.current.clone() {
             if let Some(path) = self.launch_path(&id) {
@@ -335,12 +436,17 @@ impl Store {
         Ok(())
     }
 
-    /// Bundles no state refers to.
+    /// Bundles no state refers to (an update being received is kept).
     fn prune(&self) {
+        let receiving = self
+            .staging
+            .as_ref()
+            .map(|s| format!("{}.staging", s.manifest.id));
         let keep: HashSet<&str> = [
             &self.state.current,
             &self.state.previous,
             &self.state.pending,
+            &receiving,
         ]
         .into_iter()
         .flatten()
@@ -357,13 +463,19 @@ impl Store {
         }
     }
 
-    /// Verify and keep an update for the next start. Returns its id.
-    pub fn stage(
-        &mut self,
-        manifest_bytes: &[u8],
-        signature: &str,
-        files: &[(String, Vec<u8>)],
-    ) -> Result<String, String> {
+    /// Everything a manifest must pass before anything it names is fetched:
+    /// the signature first, then the runtime, platform and app, the crash
+    /// record, and the order — an update not newer than the newest this
+    /// phone accepted (or than the bundle inside the app) is refused, so a
+    /// server or CDN replaying an old, validly signed update cannot roll the
+    /// phone back. A publisher rolls back on purpose by publishing the old
+    /// code again, which signs it with a new `createdAt`.
+    fn check(&self, manifest_bytes: &[u8], signature: &str) -> Result<Manifest, String> {
+        if manifest_bytes.len() > MAX_MANIFEST_BYTES {
+            return Err(format!(
+                "the manifest is larger than {MAX_MANIFEST_BYTES} bytes"
+            ));
+        }
         verify(&self.config.public_key, manifest_bytes, signature)?;
         let manifest = parse_manifest(manifest_bytes)?;
         if manifest.runtime != self.config.runtime {
@@ -378,57 +490,153 @@ impl Store {
                 manifest.id, manifest.platform, self.config.platform
             ));
         }
+        if let Some(app) = &self.config.app_id {
+            if manifest.app_id.as_ref() != Some(app) {
+                return Err(format!(
+                    "update {} is for {}, not this app ({app})",
+                    manifest.id,
+                    manifest.app_id.as_deref().unwrap_or("no named app")
+                ));
+            }
+        }
         if self.state.failed.contains(&manifest.id) {
             return Err(format!(
                 "update {} crashed here before: not staged again",
                 manifest.id
             ));
         }
-        if self.state.current.as_deref() == Some(manifest.id.as_str())
-            || self.state.pending.as_deref() == Some(manifest.id.as_str())
-        {
-            return Ok(manifest.id);
+        if self.is_held(&manifest.id) {
+            return Ok(manifest);
         }
-        let given: HashSet<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
-        let listed: HashSet<&str> = manifest.files.iter().map(|f| f.path.as_str()).collect();
-        if given != listed || given.len() != files.len() {
-            return Err("the files given are not the files the manifest lists".into());
+        let floor = self.floor();
+        if manifest.created_at <= floor {
+            return Err(format!(
+                "E_ROBLEDO_NOT_NEWER: update {} was built at {}, not after {floor}, the newest this phone accepted",
+                manifest.id, manifest.created_at
+            ));
         }
-        for entry in &manifest.files {
-            let data = files
-                .iter()
-                .find(|(p, _)| *p == entry.path)
-                .map(|(_, d)| d)
-                .ok_or("missing file")?;
-            if data.len() as u64 != entry.size || Sha256::digest(data).as_slice() != entry.sha256 {
-                return Err(format!(
-                    "{} does not match its digest in the manifest",
-                    entry.path
-                ));
-            }
+        Ok(manifest)
+    }
+
+    fn is_held(&self, id: &str) -> bool {
+        self.state.current.as_deref() == Some(id) || self.state.pending.as_deref() == Some(id)
+    }
+
+    /// Check a manifest and its signature (see `check`) and, when its files
+    /// are wanted, start receiving them. Nothing is fetched before this.
+    pub fn begin(&mut self, manifest_bytes: &[u8], signature: &str) -> Result<Begun, String> {
+        self.staging = None;
+        let manifest = self.check(manifest_bytes, signature)?;
+        if self.is_held(&manifest.id) {
+            return Ok(Begun {
+                id: manifest.id,
+                staging: false,
+            });
         }
+        let staging = self.staging_dir(&manifest.id);
+        let _ = std::fs::remove_dir_all(&staging);
+        std::fs::create_dir_all(staging.join("files")).map_err(|e| format!("staging: {e}"))?;
+        let id = manifest.id.clone();
+        self.staging = Some(Staging {
+            manifest,
+            bytes: manifest_bytes.to_vec(),
+            received: HashSet::new(),
+        });
+        Ok(Begun { id, staging: true })
+    }
+
+    fn staging_dir(&self, id: &str) -> PathBuf {
+        self.dir.join("bundles").join(format!("{id}.staging"))
+    }
+
+    /// One file of the update `begin` accepted: listed, not given twice, its
+    /// size and digest those of the signed manifest. Written to disk at once.
+    pub fn receive(&mut self, path: &str, data: &[u8]) -> Result<(), String> {
         let staging = self
+            .staging
+            .as_mut()
+            .ok_or("no update is being received: check its manifest first")?;
+        let entry = staging
+            .manifest
+            .files
+            .iter()
+            .find(|f| f.path == path)
+            .ok_or_else(|| format!("{path} is not a file the manifest lists"))?;
+        if staging.received.contains(path) {
+            return Err(format!("{path} was given twice"));
+        }
+        if data.len() as u64 != entry.size || Sha256::digest(data).as_slice() != entry.sha256 {
+            return Err(format!("{path} does not match its digest in the manifest"));
+        }
+        let target = self
             .dir
             .join("bundles")
-            .join(format!("{}.staging", manifest.id));
-        let _ = std::fs::remove_dir_all(&staging);
-        for (path, data) in files {
-            let target = staging.join("files").join(path);
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| format!("{path}: {e}"))?;
-            }
-            std::fs::write(&target, data).map_err(|e| format!("{path}: {e}"))?;
+            .join(format!("{}.staging", staging.manifest.id))
+            .join("files")
+            .join(path);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("{path}: {e}"))?;
         }
-        std::fs::write(staging.join("manifest.json"), manifest_bytes)
+        std::fs::write(&target, data).map_err(|e| format!("{path}: {e}"))?;
+        staging.received.insert(path.to_string());
+        Ok(())
+    }
+
+    /// Every file arrived: keep the update for the next start. Returns its id.
+    pub fn finish(&mut self) -> Result<String, String> {
+        let staging = self
+            .staging
+            .take()
+            .ok_or("no update is being received: check its manifest first")?;
+        if staging.received.len() != staging.manifest.files.len() {
+            return Err("the files given are not the files the manifest lists".into());
+        }
+        let id = staging.manifest.id;
+        let dir = self.staging_dir(&id);
+        std::fs::write(dir.join("manifest.json"), &staging.bytes)
             .map_err(|e| format!("manifest: {e}"))?;
-        let bundle = self.bundle(&manifest.id);
+        let bundle = self.bundle(&id);
         let _ = std::fs::remove_dir_all(&bundle);
-        std::fs::rename(&staging, &bundle).map_err(|e| format!("{}: {e}", bundle.display()))?;
-        if let Some(old) = self.state.pending.replace(manifest.id.clone()) {
+        std::fs::rename(&dir, &bundle).map_err(|e| format!("{}: {e}", bundle.display()))?;
+        if let Some(old) = self.state.pending.replace(id.clone()) {
             let _ = std::fs::remove_dir_all(self.bundle(&old));
         }
+        self.state.newest = self.state.newest.max(staging.manifest.created_at);
         self.save()?;
-        Ok(manifest.id)
+        Ok(id)
+    }
+
+    /// Verify and keep an update for the next start, all its files at hand.
+    /// Returns its id.
+    pub fn stage(
+        &mut self,
+        manifest_bytes: &[u8],
+        signature: &str,
+        files: &[(String, Vec<u8>)],
+    ) -> Result<String, String> {
+        let begun = self.begin(manifest_bytes, signature)?;
+        if !begun.staging {
+            return Ok(begun.id);
+        }
+        let given: HashSet<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
+        let listed: HashSet<&str> = self
+            .staging
+            .iter()
+            .flat_map(|s| s.manifest.files.iter().map(|f| f.path.as_str()))
+            .collect();
+        let received = if given != listed || given.len() != files.len() {
+            Err("the files given are not the files the manifest lists".to_string())
+        } else {
+            files
+                .iter()
+                .try_for_each(|(path, data)| self.receive(path, data))
+        };
+        if let Err(e) = received {
+            self.staging = None;
+            let _ = std::fs::remove_dir_all(self.staging_dir(&begun.id));
+            return Err(e);
+        }
+        self.finish()
     }
 
     /// What JS reads: the app's runtime and server, and where updates stand.
@@ -459,6 +667,8 @@ mod tests {
             public_key: key().verifying_key().to_bytes(),
             runtime: "rt1".into(),
             platform: "android".into(),
+            embedded_created_at: None,
+            app_id: None,
         }
     }
 
@@ -519,15 +729,26 @@ mod tests {
     /// A signed update `id` whose bundle prints `body`.
     type Files = Vec<(String, Vec<u8>)>;
 
+    /// Each update built after the one before, as `ream android:publish` stamps them.
+    static CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1_767_225_600);
+
     fn update(id: &str, body: &str, runtime: &str) -> (Vec<u8>, String, Files) {
+        let created = CLOCK.fetch_add(60, std::sync::atomic::Ordering::Relaxed);
+        update_with(id, body, runtime, json!({ "createdAt": created }))
+    }
+
+    /// An update whose manifest carries `extra` (`createdAt`, `appId`).
+    fn update_with(id: &str, body: &str, runtime: &str, extra: Value) -> (Vec<u8>, String, Files) {
         let bundle = body.as_bytes().to_vec();
-        let manifest = json!({
+        let mut manifest = json!({
             "id": id, "runtimeVersion": runtime, "platform": "android",
             "launch": "index.android.bundle",
             "files": [{ "path": "index.android.bundle", "sha256": hex(&Sha256::digest(&bundle)), "size": bundle.len() }],
-        })
-        .to_string()
-        .into_bytes();
+        });
+        if let (Some(m), Some(e)) = (manifest.as_object_mut(), extra.as_object()) {
+            m.extend(e.clone());
+        }
+        let manifest = manifest.to_string().into_bytes();
         let signature =
             base64::engine::general_purpose::STANDARD.encode(key().sign(&manifest).to_bytes());
         (
@@ -636,12 +857,12 @@ mod tests {
             assert!(!valid_path(path), "{path}");
         }
         assert!(valid_path("assets/img/logo.png"));
-        let manifest = json!({ "id": "u", "runtimeVersion": "rt1", "platform": "android", "launch": "../x",
+        let manifest = json!({ "id": "u", "createdAt": 1, "runtimeVersion": "rt1", "platform": "android", "launch": "../x",
                                "files": [{ "path": "../x", "sha256": "0".repeat(64), "size": 0 }] });
         assert!(parse_manifest(manifest.to_string().as_bytes())
             .unwrap_err()
             .contains("leaves"));
-        let bad_id = json!({ "id": "../u", "runtimeVersion": "rt1", "platform": "android", "launch": "a", "files": [] });
+        let bad_id = json!({ "id": "../u", "createdAt": 1, "runtimeVersion": "rt1", "platform": "android", "launch": "a", "files": [] });
         assert!(parse_manifest(bad_id.to_string().as_bytes())
             .unwrap_err()
             .contains("bundle id"));
@@ -686,5 +907,279 @@ mod tests {
             url: url.into(),
             ..config()
         }
+    }
+
+    fn signed(manifest: &Value) -> (Vec<u8>, String) {
+        let bytes = manifest.to_string().into_bytes();
+        let signature =
+            base64::engine::general_purpose::STANDARD.encode(key().sign(&bytes).to_bytes());
+        (bytes, signature)
+    }
+
+    #[test]
+    fn an_older_signed_update_never_replaces_a_newer_one() {
+        let dir = temp("replay");
+        // 2026-01: the vulnerable release. 2026-06: the release that fixes it.
+        let old = update_with(
+            "1767225600-a",
+            "vulnerable",
+            "rt1",
+            json!({ "createdAt": 1_767_225_600u64 }),
+        );
+        let new = update_with(
+            "1780272000-b",
+            "fixed",
+            "rt1",
+            json!({ "createdAt": 1_780_272_000u64 }),
+        );
+        let mut store = Store::open(&dir, config()).unwrap();
+        store.stage(&old.0, &old.1, &old.2).unwrap();
+        store.launch().unwrap();
+        store.ready().unwrap();
+        store.stage(&new.0, &new.1, &new.2).unwrap();
+        let mut store = Store::open(&dir, config()).unwrap();
+        assert_eq!(body(store.launch().unwrap()).as_deref(), Some("fixed"));
+        store.ready().unwrap();
+        // The server, or anything in front of it, answers with the old update.
+        let refused = store.stage(&old.0, &old.1, &old.2).unwrap_err();
+        assert!(refused.starts_with("E_ROBLEDO_NOT_NEWER: "), "{refused}");
+        let begun = store.begin(&old.0, &old.1).unwrap_err();
+        assert!(begun.starts_with("E_ROBLEDO_NOT_NEWER: "), "{begun}");
+        // Built in the same second: not newer either.
+        let same = update_with(
+            "1780272000-c",
+            "same second",
+            "rt1",
+            json!({ "createdAt": 1_780_272_000u64 }),
+        );
+        assert!(store.stage(&same.0, &same.1, &same.2).is_err());
+        // The next start still runs the fix.
+        let mut store = Store::open(&dir, config()).unwrap();
+        assert_eq!(body(store.launch().unwrap()).as_deref(), Some("fixed"));
+        // A deliberate rollback: the old code published again, so signed anew.
+        let again = update_with(
+            "1790000000-a",
+            "vulnerable",
+            "rt1",
+            json!({ "createdAt": 1_790_000_000u64 }),
+        );
+        store.ready().unwrap();
+        assert_eq!(
+            store.stage(&again.0, &again.1, &again.2).unwrap(),
+            "1790000000-a"
+        );
+    }
+
+    #[test]
+    fn a_rollback_after_a_crash_does_not_lower_the_bar() {
+        let dir = temp("bar");
+        let good = update_with("good", "good", "rt1", json!({ "createdAt": 100 }));
+        let bad = update_with("bad", "bad", "rt1", json!({ "createdAt": 200 }));
+        let between = update_with("between", "between", "rt1", json!({ "createdAt": 150 }));
+        let mut store = Store::open(&dir, config()).unwrap();
+        store.stage(&good.0, &good.1, &good.2).unwrap();
+        store.launch().unwrap();
+        store.ready().unwrap();
+        store.stage(&bad.0, &bad.1, &bad.2).unwrap();
+        store.launch().unwrap();
+        // It crashed: the next start goes back to `good`, the bar stays at 200.
+        let mut store = Store::open(&dir, config()).unwrap();
+        assert_eq!(body(store.launch().unwrap()).as_deref(), Some("good"));
+        assert!(store
+            .stage(&between.0, &between.1, &between.2)
+            .unwrap_err()
+            .starts_with("E_ROBLEDO_NOT_NEWER"));
+        let state = std::fs::read_to_string(dir.join("state.json")).unwrap();
+        assert!(state.contains(r#""newest":200"#), "{state}");
+    }
+
+    #[test]
+    fn a_state_written_before_updates_were_ordered_takes_its_bar_from_what_it_holds() {
+        let dir = temp("legacy");
+        let held = update_with("held", "held", "rt1", json!({ "createdAt": 500 }));
+        let older = update_with("older", "older", "rt1", json!({ "createdAt": 400 }));
+        let mut store = Store::open(&dir, config()).unwrap();
+        store.stage(&held.0, &held.1, &held.2).unwrap();
+        store.launch().unwrap();
+        store.ready().unwrap();
+        // The state as robledo 0.1.1 wrote it: no `newest`.
+        std::fs::write(
+            dir.join("state.json"),
+            r#"{"current":"held","previous":null,"pending":null,"trial":null,"failed":[]}"#,
+        )
+        .unwrap();
+        let mut store = Store::open(&dir, config()).unwrap();
+        assert!(store.stage(&older.0, &older.1, &older.2).is_err());
+    }
+
+    #[test]
+    fn a_store_release_with_a_newer_bundle_wins_over_older_updates() {
+        let dir = temp("store");
+        let ota = update_with("ota", "ota", "rt1", json!({ "createdAt": 1000 }));
+        let mut store = Store::open(&dir, config()).unwrap();
+        store.stage(&ota.0, &ota.1, &ota.2).unwrap();
+        assert_eq!(body(store.launch().unwrap()).as_deref(), Some("ota"));
+        store.ready().unwrap();
+        // The store release, same runtime, its bundle built after the update.
+        let released = Config {
+            embedded_created_at: Some(2000),
+            ..config()
+        };
+        let mut store = Store::open(&dir, released.clone()).unwrap();
+        assert_eq!(store.launch().unwrap(), None);
+        // An update older than the bundle inside the app is refused…
+        let stale = update_with("stale", "stale", "rt1", json!({ "createdAt": 1500 }));
+        assert!(store
+            .stage(&stale.0, &stale.1, &stale.2)
+            .unwrap_err()
+            .starts_with("E_ROBLEDO_NOT_NEWER"));
+        // …a newer one is staged and launched.
+        let next = update_with("next", "next", "rt1", json!({ "createdAt": 2500 }));
+        store.stage(&next.0, &next.1, &next.2).unwrap();
+        let mut store = Store::open(&dir, released).unwrap();
+        assert_eq!(body(store.launch().unwrap()).as_deref(), Some("next"));
+        // A build stamped `embeddedCreatedAt` and `appId` into its config.
+        let public =
+            base64::engine::general_purpose::STANDARD.encode(key().verifying_key().to_bytes());
+        let parsed = parse_config(
+            json!({ "url": "u", "publicKey": public, "runtimeVersion": "rt1", "platform": "android",
+                    "embeddedCreatedAt": 2000, "appId": "ch.example.app" })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(parsed.embedded_created_at, Some(2000));
+        assert_eq!(parsed.app_id.as_deref(), Some("ch.example.app"));
+        assert!(parse_config(
+            json!({ "url": "u", "publicKey": public, "runtimeVersion": "rt1", "platform": "android", "embeddedCreatedAt": "x" })
+                .to_string()
+                .as_bytes()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn an_app_that_knows_its_id_refuses_another_apps_update() {
+        let dir = temp("app");
+        let config = Config {
+            app_id: Some("ch.example.one".into()),
+            ..config()
+        };
+        let mut store = Store::open(&dir, config).unwrap();
+        let other = update_with(
+            "o",
+            "o",
+            "rt1",
+            json!({ "createdAt": 10, "appId": "ch.example.two" }),
+        );
+        assert!(store
+            .stage(&other.0, &other.1, &other.2)
+            .unwrap_err()
+            .contains("not this app"));
+        let unnamed = update_with("u", "u", "rt1", json!({ "createdAt": 10 }));
+        assert!(store
+            .stage(&unnamed.0, &unnamed.1, &unnamed.2)
+            .unwrap_err()
+            .contains("no named app"));
+        let mine = update_with(
+            "m",
+            "m",
+            "rt1",
+            json!({ "createdAt": 10, "appId": "ch.example.one" }),
+        );
+        assert_eq!(store.stage(&mine.0, &mine.1, &mine.2).unwrap(), "m");
+    }
+
+    #[test]
+    fn files_are_received_one_by_one_only_after_the_manifest_holds() {
+        let dir = temp("receive");
+        let mut store = Store::open(&dir, config()).unwrap();
+        assert!(store.receive("index.android.bundle", b"x").is_err());
+        assert!(store.finish().is_err());
+        let a = b"bundle".to_vec();
+        let b = b"logo".to_vec();
+        let (manifest, signature) = signed(&json!({
+            "id": "two", "createdAt": 10, "runtimeVersion": "rt1", "platform": "android",
+            "launch": "index.android.bundle",
+            "files": [
+                { "path": "index.android.bundle", "sha256": hex(&Sha256::digest(&a)), "size": a.len() },
+                { "path": "assets/logo.png", "sha256": hex(&Sha256::digest(&b)), "size": b.len() },
+            ],
+        }));
+        // A forged signature: refused before any file.
+        assert!(store.begin(&manifest, "AAAA").is_err());
+        assert!(store.receive("index.android.bundle", &a).is_err());
+        let begun = store.begin(&manifest, &signature).unwrap();
+        assert_eq!(
+            begun,
+            Begun {
+                id: "two".into(),
+                staging: true
+            }
+        );
+        assert!(store
+            .receive("other.js", &a)
+            .unwrap_err()
+            .contains("not a file"));
+        assert!(store
+            .receive("index.android.bundle", b"bundlE")
+            .unwrap_err()
+            .contains("digest"));
+        assert!(store
+            .receive("index.android.bundle", b"bundle and more")
+            .unwrap_err()
+            .contains("digest"));
+        store.receive("index.android.bundle", &a).unwrap();
+        assert!(store
+            .receive("index.android.bundle", &a)
+            .unwrap_err()
+            .contains("twice"));
+        assert!(store.finish().unwrap_err().contains("not the files"));
+        // Begin again: the files are received anew, and `ready` meanwhile
+        // (the app reaching its first screen) keeps what arrived.
+        store.begin(&manifest, &signature).unwrap();
+        store.receive("index.android.bundle", &a).unwrap();
+        store.ready().unwrap();
+        assert!(dir
+            .join("bundles/two.staging/files/index.android.bundle")
+            .is_file());
+        store.receive("assets/logo.png", &b).unwrap();
+        assert_eq!(store.finish().unwrap(), "two");
+        assert!(dir.join("bundles/two/files/assets/logo.png").is_file());
+        // Already pending: nothing more is wanted.
+        assert_eq!(
+            store.begin(&manifest, &signature).unwrap(),
+            Begun {
+                id: "two".into(),
+                staging: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_manifest_is_bounded_before_it_is_read() {
+        let dir = temp("bounds");
+        let mut store = Store::open(&dir, config()).unwrap();
+        let huge = vec![b' '; MAX_MANIFEST_BYTES + 1];
+        assert!(store.begin(&huge, "AAAA").unwrap_err().contains("larger"));
+        let files: Vec<Value> = (0..=MAX_FILES)
+            .map(|i| json!({ "path": format!("f/{i}"), "sha256": "0".repeat(64), "size": 0 }))
+            .collect();
+        let (manifest, signature) = signed(&json!({
+            "id": "many", "createdAt": 10, "runtimeVersion": "rt1", "platform": "android",
+            "launch": "f/0", "files": files,
+        }));
+        assert!(store
+            .begin(&manifest, &signature)
+            .unwrap_err()
+            .contains("more than"));
+        let (manifest, signature) = signed(&json!({
+            "id": "undated", "runtimeVersion": "rt1", "platform": "android", "launch": "a",
+            "files": [{ "path": "a", "sha256": "0".repeat(64), "size": 0 }],
+        }));
+        assert!(store
+            .begin(&manifest, &signature)
+            .unwrap_err()
+            .contains("createdAt"));
     }
 }
